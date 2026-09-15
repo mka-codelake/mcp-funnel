@@ -698,7 +698,7 @@ class McpProxyService {
             if (server.type === "sse") {
                 pingInterval = setInterval(async () => {
                     try {
-                        await client.request({ method: "ping" }, { _meta: {} } as never)
+                        await client.ping()
                         logger.debug(`[${this.userId}] Keep-alive ping sent to ${server.name}`)
                     }
                     catch (err) {
