@@ -942,7 +942,7 @@ class McpProxyService {
             case "mcp_discover_tools": {
                 const tools = this.discoverTools(args.words as SearchWords, (args.limit as number) || 10)
                 const resultText = tools.length > 0 ?
-                    `Found ${tools.length} tools:\n${tools.map((t) => `- ${t.name}: ${t.description}`).join("\n")}` :
+                    `Found ${tools.length} tools:\n${tools.map((t) => `- ${t.name} [${t.server}]: ${t.description}`).join("\n")}` :
                     "No tools found matching keywords. Try different or fewer keywords."
                 return { content: [{ type: "text", text: resultText }] }
             }
