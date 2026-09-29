@@ -238,6 +238,29 @@ class McpProxyService {
         return best
     }
 
+    /* Warns when a freshly connected server shadows tool names of another server, or reuses
+     * its name. Both make the "<server>:<tool>" form ambiguous, and an unqualified name then
+     * silently resolves to whichever server connected first. */
+    private warnOnNameCollisions (serverId: string): void {
+        const conn = this.connections.get(serverId)
+        if (!conn) return
+
+        for (const [otherId, other] of this.connections.entries()) {
+            if (otherId === serverId) continue
+
+            if (other.serverName === conn.serverName) {
+                logger.warn(`[${this.userId}] Duplicate server name "${conn.serverName}" (ids ${serverId} and ${otherId}). Qualified tool names are ambiguous; the first match wins.`)
+            }
+
+            const otherNames = new Set(other.tools.map((t) => t.name))
+            for (const tool of conn.tools) {
+                if (otherNames.has(tool.name)) {
+                    logger.warn(`[${this.userId}] Tool name collision: "${tool.name}" is provided by both "${other.serverName}" and "${conn.serverName}". Use "<server>:${tool.name}" to disambiguate.`)
+                }
+            }
+        }
+    }
+
     private findConnectionByClient (client: Client): { serverId: string; serverName: string; conn: ServerConnection } | undefined {
         for (const [serverId, conn] of this.connections.entries()) {
             if (conn.client === client) {
@@ -723,6 +746,8 @@ class McpProxyService {
 
             this.serverManager.updateConnectionStatus(server.id, true)
 
+            this.warnOnNameCollisions(server.id)
+
             /* Forward notifications from backend clients to inbound MCP clients */
             this.registerBackendNotifications(client)
         }
@@ -782,6 +807,7 @@ class McpProxyService {
                         _serverId: found.serverId,
                         _serverName: found.serverName
                     }))
+                    this.warnOnNameCollisions(found.serverId)
                 }
                 catch (e) {
                     logger.warn(`[${this.userId}] Failed to refresh tools: ${getErrorMessage(e)}`)
