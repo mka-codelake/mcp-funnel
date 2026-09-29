@@ -24,22 +24,26 @@ function makeTmpDir (): string {
     return fs.mkdtempSync(path.join(os.tmpdir(), "mcp-funnel-spec-"))
 }
 
-function writeServerConfig (dataDir: string, backendUrl: string): void {
+function writeServerConfig (dataDir: string, backendUrl: string, disabledTools: string[] = []): void {
+    writeServersConfig(dataDir, [{ id: "spec-test-backend", name: "spec-test", url: backendUrl, disabledTools }])
+}
+
+function writeServersConfig (dataDir: string, entries: Array<{ id: string; name: string; url: string; disabledTools?: string[] }>): void {
     const serversDir = path.join(dataDir, "servers")
     fs.mkdirSync(serversDir, { recursive: true })
     const serverConfig = {
-        servers: [{
-            id: "spec-test-backend",
-            name: "spec-test",
+        servers: entries.map((e) => ({
+            id: e.id,
+            name: e.name,
             type: "http",
             enabled: true,
-            config: { url: backendUrl },
-            disabledTools: [],
+            config: { url: e.url },
+            disabledTools: e.disabledTools ?? [],
             createdAt: new Date().toISOString(),
             updatedAt: null,
             lastConnected: null,
             lastError: null
-        }]
+        }))
     }
     fs.writeFileSync(path.join(serversDir, "local.json"), JSON.stringify(serverConfig, null, 2))
 }
@@ -168,6 +172,56 @@ describe("MCP spec proxy integration", () => {
             })
             const text = (result.content as Array<{ type: string; text: string }>)[0].text
             assert.ok(text.includes("spec_echo"), "should find spec_echo")
+        })
+
+        it("discovery results name the owning server", async () => {
+            const result = await client.callTool({
+                name: "mcp_discover_tools",
+                arguments: { words: "spec echo" }
+            })
+            const text = (result.content as Array<{ type: string; text: string }>)[0].text
+            assert.ok(text.includes("spec_echo [spec-test]:"),
+                `expected "- spec_echo [spec-test]: ..." in:\n${text}`)
+        })
+
+        it("a server-qualified tool name is callable", async () => {
+            const result = await client.callTool({
+                name: "mcp_call_tool",
+                arguments: { tool_name: "spec-test:spec_echo", arguments: { message: "qualified" } }
+            })
+            const text = (result.content as Array<{ type: string; text: string }>)[0].text
+            assert.equal(text, "qualified",
+                "the backend must receive the unqualified name")
+        })
+
+        it("a server-qualified schema lookup resolves to that server", async () => {
+            const result = await client.callTool({
+                name: "mcp_get_tool_schema",
+                arguments: { tool_name: "spec-test:spec_annotated" }
+            })
+            const schema = JSON.parse((result.content as Array<{ type: string; text: string }>)[0].text)
+            assert.equal(schema.title, "Annotated Tool")
+            assert.equal(schema.server, "spec-test")
+        })
+
+        it("a known server without the tool reports which server was meant", async () => {
+            const result = await client.callTool({
+                name: "mcp_get_tool_schema",
+                arguments: { tool_name: "spec-test:does_not_exist" }
+            })
+            const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0].text)
+            assert.ok(parsed.error.includes("does_not_exist"), parsed.error)
+            assert.ok(parsed.error.includes("spec-test"), parsed.error)
+        })
+
+        it("an unknown prefix is treated as part of the tool name", async () => {
+            const result = await client.callTool({
+                name: "mcp_get_tool_schema",
+                arguments: { tool_name: "nosuchserver:spec_echo" }
+            })
+            const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0].text)
+            assert.ok(parsed.error.includes("nosuchserver:spec_echo"), parsed.error)
+            assert.ok(parsed.error.includes("<server>:<tool>"), parsed.error)
         })
 
         it("spec_echo is callable via mcp_call_tool", async () => {
@@ -613,5 +667,153 @@ describe("MCP spec proxy integration", () => {
             assert.ok(data.result.capabilities.resources.listChanged)
             assert.ok(data.result.capabilities.resources.subscribe)
         })
+    })
+})
+
+/* ── H. Disabled tools ──────────────────────────────────
+ * Guards the pre-existing split: getToolSchema hides disabled tools, while callTool still
+ * reaches them. A resolver that unified both tool sets would break one of the two. */
+
+describe("MCP proxy with a disabled tool", () => {
+    let tmpDir: string
+    let backendShutdown: () => Promise<void>
+    let funnelShutdown: () => Promise<void>
+    let client: Client
+
+    before(async () => {
+        const backend = await createSpecServer(0)
+        backendShutdown = backend.shutdown
+
+        tmpDir = makeTmpDir()
+        writeServerConfig(tmpDir, backend.url, ["spec_echo"])
+
+        const funnel = await startFunnel(tmpDir)
+        funnelShutdown = funnel.shutdown
+
+        client = await createTestClient(funnel.baseUrl)
+        await new Promise(r => setTimeout(r, 3000))
+    })
+
+    after(async () => {
+        try { await (client as unknown as { close: () => Promise<void> }).close() } catch { /* ignore */ }
+        await funnelShutdown()
+        await backendShutdown()
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+    })
+
+    it("hides a disabled tool from discovery", async () => {
+        const result = await client.callTool({
+            name: "mcp_discover_tools",
+            arguments: { words: "spec echo" }
+        })
+        const text = (result.content as Array<{ type: string; text: string }>)[0].text
+        assert.ok(!text.includes("spec_echo ["), `spec_echo should be hidden, got:\n${text}`)
+    })
+
+    it("hides a disabled tool from mcp_get_tool_schema", async () => {
+        const result = await client.callTool({
+            name: "mcp_get_tool_schema",
+            arguments: { tool_name: "spec_echo" }
+        })
+        const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0].text)
+        assert.ok(parsed.error, "disabled tool must not expose a schema")
+    })
+
+    it("still calls a disabled tool (pre-existing behaviour)", async () => {
+        const result = await client.callTool({
+            name: "mcp_call_tool",
+            arguments: { tool_name: "spec_echo", arguments: { message: "still reachable" } }
+        })
+        const text = (result.content as Array<{ type: string; text: string }>)[0].text
+        assert.equal(text, "still reachable")
+    })
+})
+
+/* -- I. Two backends with colliding tool names ------------
+ * The scenario the qualified-name syntax exists for: the same tool name served by two
+ * backends. Unqualified lookups hit whichever connected first; qualified ones must reach
+ * exactly the addressed server. */
+
+describe("MCP proxy with two backends exposing the same tool", () => {
+    let tmpDir: string
+    let shutdownA: () => Promise<void>
+    let shutdownB: () => Promise<void>
+    let funnelShutdown: () => Promise<void>
+    let client: Client
+
+    before(async () => {
+        const backendA = await createSpecServer(0)
+        const backendB = await createSpecServer(0)
+        shutdownA = backendA.shutdown
+        shutdownB = backendB.shutdown
+
+        tmpDir = makeTmpDir()
+        writeServersConfig(tmpDir, [
+            { id: "backend-a", name: "alpha", url: backendA.url },
+            { id: "backend-b", name: "beta", url: backendB.url }
+        ])
+
+        const funnel = await startFunnel(tmpDir)
+        funnelShutdown = funnel.shutdown
+
+        client = await createTestClient(funnel.baseUrl)
+        await new Promise(r => setTimeout(r, 3000))
+    })
+
+    after(async () => {
+        try { await (client as unknown as { close: () => Promise<void> }).close() } catch { /* ignore */ }
+        await funnelShutdown()
+        await shutdownA()
+        await shutdownB()
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+    })
+
+    it("discovery lists the shared tool once per server", async () => {
+        const result = await client.callTool({
+            name: "mcp_discover_tools",
+            arguments: { words: "spec echo", limit: 50 }
+        })
+        const text = (result.content as Array<{ type: string; text: string }>)[0].text
+        assert.ok(text.includes("spec_echo [alpha]:"), `missing alpha entry in:\n${text}`)
+        assert.ok(text.includes("spec_echo [beta]:"), `missing beta entry in:\n${text}`)
+    })
+
+    it("each qualified name reaches its own backend", async () => {
+        for (const server of ["alpha", "beta"]) {
+            const result = await client.callTool({
+                name: "mcp_call_tool",
+                arguments: { tool_name: `${server}:spec_echo`, arguments: { message: server } }
+            })
+            const text = (result.content as Array<{ type: string; text: string }>)[0].text
+            assert.equal(text, server)
+        }
+    })
+
+    it("a qualified schema lookup reports the addressed server", async () => {
+        const result = await client.callTool({
+            name: "mcp_get_tool_schema",
+            arguments: { tool_name: "beta:spec_annotated" }
+        })
+        const schema = JSON.parse((result.content as Array<{ type: string; text: string }>)[0].text)
+        assert.equal(schema.server, "beta")
+    })
+
+    it("an unqualified name still resolves to a single backend", async () => {
+        const result = await client.callTool({
+            name: "mcp_call_tool",
+            arguments: { tool_name: "spec_echo", arguments: { message: "unqualified" } }
+        })
+        const text = (result.content as Array<{ type: string; text: string }>)[0].text
+        assert.equal(text, "unqualified")
+    })
+
+    it("calling a known server that lacks the tool names that server", async () => {
+        await assert.rejects(
+            () => client.callTool({
+                name: "mcp_call_tool",
+                arguments: { tool_name: "alpha:does_not_exist", arguments: {} }
+            }),
+            (err: Error) => err.message.includes("alpha") && err.message.includes("does_not_exist")
+        )
     })
 })

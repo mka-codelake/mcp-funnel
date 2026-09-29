@@ -5,7 +5,8 @@ import assert from "node:assert/strict"
 
 import {
     levenshtein, tokenize, fuzzyThreshold, fuzzyMatchTokens,
-    matchesWordBoundary, scoreKeyword, scoreTool, searchTools, getMetaTools
+    matchesWordBoundary, scoreKeyword, scoreTool, searchTools, getMetaTools,
+    splitQualifiedToolName, resolveToolName
 } from "../src/mcp-meta-tools.js"
 import type { ToolWithServer } from "../src/mcp-meta-tools.js"
 
@@ -237,5 +238,86 @@ describe("getMetaTools", () => {
         const tools = getMetaTools(42)
         const schema = tools.find((t) => t.name === "mcp_get_tool_schema")!
         assert.ok(!schema.description.includes("42"))
+    })
+})
+
+/* -- splitQualifiedToolName ------------------------------ */
+
+describe("splitQualifiedToolName", () => {
+    it("U1: splits a qualified name at the colon", () => {
+        assert.deepEqual(splitQualifiedToolName("gitlab:list_branches"),
+            { serverName: "gitlab", bareName: "list_branches" })
+    })
+
+    it("U2: leaves an unqualified name untouched", () => {
+        assert.deepEqual(splitQualifiedToolName("list_branches"), { bareName: "list_branches" })
+    })
+
+    it("U3: splits at the FIRST colon only", () => {
+        assert.deepEqual(splitQualifiedToolName("srv:a:b"), { serverName: "srv", bareName: "a:b" })
+    })
+
+    it("U4: treats a leading colon as part of the tool name", () => {
+        assert.deepEqual(splitQualifiedToolName(":foo"), { bareName: ":foo" })
+    })
+})
+
+/* -- resolveToolName ------------------------------------- */
+
+describe("resolveToolName", () => {
+    const gitlabBranches = makeTool("list_branches", "gitlab variant", "gitlab")
+    const sonarBranches = makeTool("list_branches", "sonar variant", "sonarqube")
+    const tools = [gitlabBranches, sonarBranches]
+    const known = ["gitlab", "sonarqube"]
+
+    it("U5: a qualified name selects the tool of that server", () => {
+        const viaSonar = resolveToolName(tools, "sonarqube:list_branches", known)
+        assert.equal(viaSonar.status, "found")
+        assert.equal(viaSonar.status === "found" && viaSonar.tool.description, "sonar variant")
+
+        const viaGitlab = resolveToolName(tools, "gitlab:list_branches", known)
+        assert.equal(viaGitlab.status === "found" && viaGitlab.tool.description, "gitlab variant")
+    })
+
+    it("U6: an unqualified name keeps the legacy first-match behaviour", () => {
+        const res = resolveToolName(tools, "list_branches", known)
+        assert.equal(res.status, "found")
+        assert.equal(res.status === "found" && res.tool.description, "gitlab variant")
+    })
+
+    it("U7: an unknown prefix falls back to a lookup of the full string", () => {
+        const odd = makeTool("weird:name", "colon in its own name", "gitlab")
+        const res = resolveToolName([...tools, odd], "weird:name", known)
+        assert.equal(res.status, "found")
+        assert.equal(res.status === "found" && res.tool.description, "colon in its own name")
+    })
+
+    it("U8: a known server without that tool reports server-known-tool-missing", () => {
+        const res = resolveToolName(tools, "gitlab:show_rule", known)
+        assert.equal(res.status, "server-known-tool-missing")
+        assert.equal(res.status === "server-known-tool-missing" && res.serverName, "gitlab")
+        assert.equal(res.status === "server-known-tool-missing" && res.bareName, "show_rule")
+    })
+
+    it("U9: server matching is case-sensitive", () => {
+        const res = resolveToolName(tools, "GitLab:list_branches", ["gitlab"])
+        assert.equal(res.status, "not-found")
+    })
+
+    it("U12: a tool whose own name looks qualified stays reachable", () => {
+        /* "hafas" is a real server here, so "hafas:search" reads as qualified first.
+         * No server "hafas" offers "search", but gitlab offers a tool literally named
+         * "hafas:search" - that must still win over reporting it as missing. */
+        const odd = makeTool("hafas:search", "literal colon name", "gitlab")
+        const res = resolveToolName([...tools, odd], "hafas:search", ["gitlab", "hafas"])
+        assert.equal(res.status, "found")
+        assert.equal(res.status === "found" && res.tool.description, "literal colon name")
+    })
+
+    it("U13: the qualified reading takes precedence over the literal one", () => {
+        const literal = makeTool("sonarqube:list_branches", "literal", "gitlab")
+        const res = resolveToolName([...tools, literal], "sonarqube:list_branches", known)
+        assert.equal(res.status, "found")
+        assert.equal(res.status === "found" && res.tool.description, "sonar variant")
     })
 })
