@@ -35,7 +35,7 @@ import { McpServerManager, McpServerEntry, isUrlConfig, isStdioConfig } from "./
 import { ensureValidToken } from "./oauth/oauth-client.js"
 import type { BackendOAuthConfig } from "./oauth/oauth-client.js"
 
-import { isMetaTool, getMetaTools, searchTools } from "./mcp-meta-tools.js"
+import { isMetaTool, getMetaTools, searchTools, resolveToolName } from "./mcp-meta-tools.js"
 import type { SearchWords, ToolWithServer, MetaTool } from "./mcp-meta-tools.js"
 
 interface ServerConnection {
@@ -64,6 +64,13 @@ interface ReconnectState {
     backoffMs: number
     timeoutId: ReturnType<typeof setTimeout> | null
 }
+
+/* Result of locating a tool. Carries enough context to tell "no such tool anywhere" apart
+ * from "that server exists but does not offer this tool", so the caller can report why. */
+type ToolLookup =
+    | { status: "found", serverId: string, tool: ToolWithServer, client: Client }
+    | { status: "server-known-tool-missing", serverName: string, bareName: string }
+    | { status: "not-found", toolName: string }
 
 /* MCP logging levels in ascending severity (RFC 5424) */
 const LOG_LEVEL_SEVERITY: Record<string, number> = {
@@ -945,11 +952,36 @@ class McpProxyService {
         return searchTools(allTools, words, limit)
     }
 
+    /* Names of all configured servers, including ones that are currently not connected.
+     * Used as the set of valid "<server>:" prefixes. */
+    private knownServerNames (): string[] {
+        return this.serverManager.getEnabledServers().map((s) => s.name)
+    }
+
+    /* Maps a server name to its id, regardless of whether it is currently connected. */
+    private serverIdByName (serverName: string): string | undefined {
+        return this.serverManager.getEnabledServers().find((s) => s.name === serverName)?.id
+    }
+
+    private isServerConnected (serverName: string): boolean {
+        const id = this.serverIdByName(serverName)
+        return id !== undefined && this.connections.has(id)
+    }
+
     private getToolSchema (toolName: string) {
-        const tool = this.getAllToolsInternal().find((t) => t.name === toolName)
-        if (!tool) {
-            return { error: `Tool not found: ${toolName}` }
+        const resolution = resolveToolName(this.getAllToolsInternal(), toolName, this.knownServerNames())
+        if (resolution.status === "server-known-tool-missing") {
+            /* This only sees connected servers, so "missing" may just mean "offline".
+             * Saying the tool does not exist there would send the caller hunting for a typo. */
+            if (!this.isServerConnected(resolution.serverName)) {
+                return { error: `Server "${resolution.serverName}" is not connected, cannot look up "${resolution.bareName}"` }
+            }
+            return { error: `Tool "${resolution.bareName}" not found on server "${resolution.serverName}"` }
         }
+        if (resolution.status === "not-found") {
+            return { error: `Tool not found: ${toolName}. If the name is ambiguous, qualify it as "<server>:<tool>".` }
+        }
+        const tool = resolution.tool
         return {
             name: tool.name,
             title: tool.title,
@@ -1008,21 +1040,30 @@ class McpProxyService {
         }
     }
 
-    private findToolServer (toolName: string): { serverId: string; tool: ToolWithServer; client: Client } | null {
-        for (const [serverId, conn] of this.connections.entries()) {
-            const tool = conn.tools.find((t) => t.name === toolName)
-            if (tool) {
-                return { serverId, tool, client: conn.client }
-            }
+    /* Resolves a (possibly qualified) tool name against all connected backends.
+     * Deliberately searches conn.tools unfiltered, i.e. tools disabled in the UI stay callable,
+     * which is the pre-existing behaviour. getToolSchema, in contrast, hides them. */
+    private findToolServer (toolName: string): ToolLookup {
+        const allTools: ToolWithServer[] = []
+        for (const conn of this.connections.values()) {
+            allTools.push(...conn.tools)
         }
-        return null
+
+        const resolution = resolveToolName(allTools, toolName, this.knownServerNames())
+        if (resolution.status !== "found") return resolution
+
+        const conn = this.connections.get(resolution.tool._serverId)
+        if (!conn) return { status: "not-found", toolName }
+
+        return { status: "found", serverId: resolution.tool._serverId, tool: resolution.tool, client: conn.client }
     }
 
-    private async tryReconnectForTool (toolName: string): Promise<{ serverId: string; tool: ToolWithServer; client: Client } | null> {
+    private async tryReconnectForTool (toolName: string, onlyServerId?: string): Promise<ToolLookup> {
         const servers = this.serverManager.getEnabledServers()
 
         for (const server of servers) {
             if (this.connections.has(server.id)) continue
+            if (onlyServerId && server.id !== onlyServerId) continue
 
             const state = this.reconnectState.get(server.id)
             if (state && state.attempts >= this.MAX_RECONNECT_ATTEMPTS) {
@@ -1036,7 +1077,7 @@ class McpProxyService {
             try {
                 await this.reconnectServer(server.id)
                 const found = this.findToolServer(toolName)
-                if (found) {
+                if (found.status === "found") {
                     logger.info(`[${this.userId}] Found tool ${toolName} after reconnecting ${server.name}`)
                     return found
                 }
@@ -1046,7 +1087,7 @@ class McpProxyService {
                 logger.debug(`[${this.userId}] On-demand reconnect failed for ${server.name}: ${msg}`)
             }
         }
-        return null
+        return { status: "not-found", toolName }
     }
 
     private isSessionError (error: Error): boolean {
@@ -1185,20 +1226,37 @@ class McpProxyService {
     }
 
     async callTool (toolName: string, args: Record<string, unknown>, retryOnSessionError = true, taskMeta?: Record<string, unknown>): Promise<unknown> {
-        let found = this.findToolServer(toolName)
+        let lookup = this.findToolServer(toolName)
 
-        if (!found) {
-            found = await this.tryReconnectForTool(toolName)
-            if (!found) {
-                throw new Error(`Tool not found: ${toolName}`)
+        if (lookup.status === "server-known-tool-missing") {
+            const { serverName, bareName } = lookup
+            /* The prefix names a configured server. If that server is connected, the tool
+             * genuinely does not exist there and reconnecting others would not help. */
+            const targetId = this.serverIdByName(serverName)
+            const wasConnected = targetId !== undefined && this.connections.has(targetId)
+            if (targetId && !wasConnected) {
+                lookup = await this.tryReconnectForTool(toolName, targetId)
+            }
+            if (lookup.status !== "found") {
+                throw new Error(wasConnected ?
+                    `Tool "${bareName}" not found on server "${serverName}"` :
+                    `Server "${serverName}" is not connected, cannot call "${bareName}"`)
+            }
+        }
+        else if (lookup.status === "not-found") {
+            lookup = await this.tryReconnectForTool(toolName)
+            if (lookup.status !== "found") {
+                throw new Error(`Tool not found: ${toolName}. If the name is ambiguous, qualify it as "<server>:<tool>".`)
             }
         }
 
-        const { client, serverId } = found
+        const { client, serverId, tool } = lookup
 
         try {
             const callParams: Record<string, unknown> = {
-                name: toolName,
+                /* The backend only knows the unqualified name. Everything else - logging,
+                 * the retry below, error messages - keeps the name as the caller wrote it. */
+                name: tool.name,
                 arguments: args
             }
             if (taskMeta) {

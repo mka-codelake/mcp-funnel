@@ -26,6 +26,12 @@ interface ToolSearchResult {
     score?: number
 }
 
+/* Outcome of resolving a (possibly server-qualified) tool name. */
+type ToolResolution<T> =
+    | { status: "found", tool: T }
+    | { status: "server-known-tool-missing", serverName: string, bareName: string }
+    | { status: "not-found", toolName: string }
+
 interface MetaTool {
     name: string
     description: string
@@ -89,7 +95,7 @@ const META_TOOLS: MetaTool[] = [
             properties: {
                 tool_name: {
                     type: "string",
-                    description: "The exact tool name as returned by mcp_discover_tools"
+                    description: "The exact tool name as returned by mcp_discover_tools. If two servers expose the same tool name, qualify it as \"<server>:<tool>\" using the server shown in brackets by mcp_discover_tools."
                 }
             },
             required: ["tool_name"]
@@ -103,7 +109,7 @@ const META_TOOLS: MetaTool[] = [
             properties: {
                 tool_name: {
                     type: "string",
-                    description: "The exact tool name to execute"
+                    description: "The exact tool name to execute. If two servers expose the same tool name, qualify it as \"<server>:<tool>\" using the server shown in brackets by mcp_discover_tools."
                 },
                 arguments: {
                     type: "object",
@@ -303,6 +309,47 @@ function truncateDescription (description: string): string {
     return description
 }
 
+/* ── Qualified tool names ─────────────────────────────── */
+
+/* Splits "<server>:<tool>" at the FIRST colon.
+ * A leading colon or no colon at all means the whole string is the tool name. */
+function splitQualifiedToolName (toolName: string): { serverName?: string, bareName: string } {
+    const idx = toolName.indexOf(":")
+    if (idx <= 0) return { bareName: toolName }
+    return { serverName: toolName.slice(0, idx), bareName: toolName.slice(idx + 1) }
+}
+
+/* Resolves a tool name against the given list.
+ * knownServerNames is passed in rather than derived from the tools, so that a configured but
+ * currently disconnected server is still recognised as a known prefix. Matching is
+ * case-sensitive.
+ *
+ * Nothing stops a backend from putting a colon into a tool name: only the three meta-tools are
+ * exposed as function names, backend tool names travel as a plain string argument. The
+ * qualified reading therefore wins, but a tool whose own name merely looks qualified stays
+ * reachable through the literal fallback. */
+function resolveToolName<T extends { name: string, _serverName: string }> (
+    tools: T[],
+    toolName: string,
+    knownServerNames: readonly string[]
+): ToolResolution<T> {
+    const { serverName, bareName } = splitQualifiedToolName(toolName)
+
+    if (serverName !== undefined && knownServerNames.includes(serverName)) {
+        const qualified = tools.find((t) => t._serverName === serverName && t.name === bareName)
+        if (qualified) return { status: "found", tool: qualified }
+
+        const literal = tools.find((t) => t.name === toolName)
+        if (literal) return { status: "found", tool: literal }
+
+        return { status: "server-known-tool-missing", serverName, bareName }
+    }
+
+    const tool = tools.find((t) => t.name === toolName)
+    if (tool) return { status: "found", tool }
+    return { status: "not-found", toolName }
+}
+
 /* ── Search ───────────────────────────────────────────── */
 
 function searchTools (allTools: ToolWithServer[], words: SearchWords, limit = 10): ToolSearchResult[] {
@@ -332,6 +379,6 @@ function searchTools (allTools: ToolWithServer[], words: SearchWords, limit = 10
     }))
 }
 
-export { META_TOOLS, isMetaTool, getMetaTools, searchTools, parseWordsParameter, matchesKeywords }
+export { META_TOOLS, isMetaTool, getMetaTools, searchTools, parseWordsParameter, matchesKeywords, splitQualifiedToolName, resolveToolName }
 export { levenshtein, tokenize, fuzzyThreshold, fuzzyMatchTokens, matchesWordBoundary, scoreKeyword, scoreTool }
-export type { SearchWords, ToolWithServer, ToolSearchResult, MetaTool }
+export type { SearchWords, ToolWithServer, ToolSearchResult, MetaTool, ToolResolution }
