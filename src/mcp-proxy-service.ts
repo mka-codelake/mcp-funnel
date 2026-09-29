@@ -42,6 +42,9 @@ interface ServerConnection {
     client: Client
     transport: SSEClientTransport | StreamableHTTPClientTransport | StdioClientTransport
     tools: ToolWithServer[]
+    /* Configured name from the server registry. Authoritative for tool qualification:
+     * unlike serverInfo.name (reported by the backend) it never changes at runtime. */
+    serverName: string
     serverInfo: { name?: string; version?: string } | undefined
     capabilities: Record<string, unknown> | undefined
     pingInterval: ReturnType<typeof setInterval> | null
@@ -238,7 +241,7 @@ class McpProxyService {
     private findConnectionByClient (client: Client): { serverId: string; serverName: string; conn: ServerConnection } | undefined {
         for (const [serverId, conn] of this.connections.entries()) {
             if (conn.client === client) {
-                return { serverId, serverName: conn.serverInfo?.name || serverId, conn }
+                return { serverId, serverName: conn.serverName, conn }
             }
         }
         return undefined
@@ -712,6 +715,7 @@ class McpProxyService {
                 client,
                 transport,
                 tools,
+                serverName: server.name,
                 serverInfo: serverInfo as { name?: string; version?: string } | undefined,
                 capabilities: capabilities as Record<string, unknown> | undefined,
                 pingInterval
