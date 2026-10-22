@@ -23,6 +23,9 @@ export interface SpecServer {
     offerWhoami: (offered: boolean) => void
     /* Answers the next tools/call requests with these HTTP errors, one per request */
     failNextToolCalls: (failures: Array<{ status: number, body: string }>) => void
+    /* Holds initialize requests from now on until the returned function is called;
+     * initCount() already counts a held request */
+    holdInitialize: () => () => void
     shutdown: () => Promise<void>
 }
 
@@ -42,6 +45,8 @@ export async function createSpecServer (port?: number, options: SpecServerOption
     const name = options.name ?? "spec"
     let inits = 0
     let withWhoami = true
+    let initGate: Promise<void> | null = null
+    let releaseInit: (() => void) | null = null
     const pendingFailures: Array<{ status: number, body: string }> = []
 
     /* One McpServer per session: a Protocol instance can only serve a single transport,
@@ -79,6 +84,7 @@ export async function createSpecServer (port?: number, options: SpecServerOption
 
             if (isInit) {
                 inits++
+                if (initGate) await initGate
                 const server = createMcpServer(name, withWhoami)
                 servers.add(server)
                 const transport = new StreamableHTTPServerTransport({
@@ -147,11 +153,13 @@ export async function createSpecServer (port?: number, options: SpecServerOption
     }
 
     const shutdown = async () => {
+        releaseInit?.()
         await dropSessions()
         for (const server of servers) {
             try { await server.close() } catch { /* ignore */ }
         }
         servers.clear()
+        httpServer.closeAllConnections()
         await new Promise<void>((resolve) => httpServer.close(() => resolve()))
     }
 
@@ -162,6 +170,16 @@ export async function createSpecServer (port?: number, options: SpecServerOption
         initCount: () => inits,
         offerWhoami: (offered) => { withWhoami = offered },
         failNextToolCalls: (failures) => { pendingFailures.push(...failures) },
+        holdInitialize: () => {
+            let open = () => { /* replaced below */ }
+            initGate = new Promise<void>((resolve) => { open = resolve })
+            releaseInit = () => {
+                initGate = null
+                releaseInit = null
+                open()
+            }
+            return releaseInit
+        },
         shutdown
     }
 }
