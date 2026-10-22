@@ -65,6 +65,24 @@ interface ReconnectState {
     timeoutId: ReturnType<typeof setTimeout> | null
 }
 
+/* Background reconnect after a backend dropped: the wait doubles from initialBackoffMs up to
+ * maxBackoffMs. After maxAttempts failures the server rests for cooldownMs, then a new series
+ * starts. initialBackoffMs is also the minimum gap between on-demand reconnects that client
+ * calls trigger. Configurable so tests do not have to wait minutes. */
+interface ReconnectTiming {
+    maxAttempts: number
+    initialBackoffMs: number
+    maxBackoffMs: number
+    cooldownMs: number
+}
+
+const DEFAULT_RECONNECT_TIMING: ReconnectTiming = {
+    maxAttempts: 5,
+    initialBackoffMs: 5000,
+    maxBackoffMs: 300000,
+    cooldownMs: 600000
+}
+
 /* Result of locating a tool. Carries enough context to tell "no such tool anywhere" apart
  * from "that server exists but does not offer this tool", so the caller can report why. */
 type ToolLookup =
@@ -113,12 +131,13 @@ class McpProxyService {
     /* taskId → { serverId, backendTaskId } */
     private taskMapping = new Map<string, { serverId: string; backendTaskId: string }>()
     private sessionCleanupTimer: ReturnType<typeof setInterval> | null = null
+    private isShutDown = false
 
+    /* serverId → connection attempt in flight; callers for the same server share it */
+    private pendingConnects = new Map<string, Promise<void>>()
+
+    private readonly timing: ReconnectTiming
     private readonly PING_INTERVAL = 30000
-    private readonly MAX_RECONNECT_ATTEMPTS = 5
-    private readonly INITIAL_BACKOFF_MS = 5000
-    private readonly MAX_BACKOFF_MS = 300000
-    private readonly COOLDOWN_MS = 600000
 
     /* 30 minutes */
     private readonly SESSION_IDLE_TTL = 30 * 60 * 1000
@@ -126,11 +145,12 @@ class McpProxyService {
     /* 5 minutes */
     private readonly SESSION_CLEANUP_INTERVAL = 5 * 60 * 1000
 
-    constructor (serverManager: McpServerManager, userId: string) {
+    constructor (serverManager: McpServerManager, userId: string, timing: Partial<ReconnectTiming> = {}) {
         this.connections = new Map()
         this.reconnectState = new Map()
         this.serverManager = serverManager
         this.userId = userId
+        this.timing = { ...DEFAULT_RECONNECT_TIMING, ...timing }
     }
 
     async initialize (): Promise<void> {
@@ -149,7 +169,10 @@ class McpProxyService {
             }
         }
 
-        this.sessionCleanupTimer = setInterval(() => this.cleanupStaleSessions(), this.SESSION_CLEANUP_INTERVAL)
+        /* refresh() calls initialize() again; one cleanup timer is enough */
+        if (!this.sessionCleanupTimer) {
+            this.sessionCleanupTimer = setInterval(() => this.cleanupStaleSessions(), this.SESSION_CLEANUP_INTERVAL)
+        }
         logger.info(`[${this.userId}] Inbound SDK Server ready for sessions`)
     }
 
@@ -626,6 +649,9 @@ class McpProxyService {
 
     async shutdown (): Promise<void> {
         logger.info(`[${this.userId}] Shutting down MCP proxy`)
+        /* A reconnect attempt already in flight must neither schedule the next one
+         * nor keep the connection it opens */
+        this.isShutDown = true
         if (this.sessionCleanupTimer) {
             clearInterval(this.sessionCleanupTimer)
             this.sessionCleanupTimer = null
@@ -657,7 +683,13 @@ class McpProxyService {
         this.inboundSessions.clear()
     }
 
+    /* Connects a server, replacing an existing connection to it, through the single-flight
+     * path. Only server.id counts; the configuration is read from the registry. */
     async connectServer (server: McpServerEntry): Promise<void> {
+        await this.connectFresh(server.id)
+    }
+
+    private async establishConnection (server: McpServerEntry): Promise<ServerConnection> {
         logger.info(`[${this.userId}] Connecting to MCP server: ${server.name} (${server.type})`)
 
         /* Refresh OAuth token before connecting if configured */
@@ -701,6 +733,7 @@ class McpProxyService {
         )
 
         transport.onerror = (error: Error) => {
+            if (this.isShutDown) return
             const msg = error.message || ""
 
             if (msg.includes("Failed to open SSE stream")
@@ -762,7 +795,7 @@ class McpProxyService {
                 }, this.PING_INTERVAL)
             }
 
-            this.connections.set(server.id, {
+            const conn: ServerConnection = {
                 client,
                 transport,
                 tools,
@@ -770,7 +803,8 @@ class McpProxyService {
                 serverInfo: serverInfo as { name?: string; version?: string } | undefined,
                 capabilities: capabilities as Record<string, unknown> | undefined,
                 pingInterval
-            })
+            }
+            this.connections.set(server.id, conn)
 
             this.serverManager.updateConnectionStatus(server.id, true)
 
@@ -778,6 +812,7 @@ class McpProxyService {
 
             /* Forward notifications from backend clients to inbound MCP clients */
             this.registerBackendNotifications(client)
+            return conn
         }
         catch (error) {
             try {
@@ -1085,18 +1120,11 @@ class McpProxyService {
         for (const server of servers) {
             if (this.connections.has(server.id)) continue
             if (onlyServerId && server.id !== onlyServerId) continue
-
-            const state = this.reconnectState.get(server.id)
-            if (state && state.attempts >= this.MAX_RECONNECT_ATTEMPTS) {
-                const timeSinceLastAttempt = Date.now() - state.lastAttempt
-                if (timeSinceLastAttempt < this.COOLDOWN_MS) {
-                    continue
-                }
-            }
+            if (!this.mayReconnectOnDemand(server.id, onlyServerId !== undefined)) continue
 
             logger.info(`[${this.userId}] Attempting on-demand reconnect to ${server.name} for tool: ${toolName}`)
             try {
-                await this.reconnectServer(server.id)
+                await this.restoreConnection(server.id)
                 const found = this.findToolServer(toolName)
                 if (found.status === "found") {
                     logger.info(`[${this.userId}] Found tool ${toolName} after reconnecting ${server.name}`)
@@ -1104,11 +1132,38 @@ class McpProxyService {
                 }
             }
             catch (e) {
+                this.reconnectStateFor(server.id).lastAttempt = Date.now()
                 const msg = getErrorMessage(e)
                 logger.debug(`[${this.userId}] On-demand reconnect failed for ${server.name}: ${msg}`)
+                this.scheduleReconnect(server.id)
             }
         }
         return { status: "not-found", toolName }
+    }
+
+    /* Client calls trigger on-demand reconnects, so they are rate limited to one per
+     * initialBackoffMs and server. They leave a scheduled background attempt alone: postponing
+     * it on every call would let a busy client stall the background series. A name that may
+     * belong to any server does not wake one that rests after a failed series; a qualified
+     * name addresses this one server and may. */
+    private mayReconnectOnDemand (serverId: string, explicit: boolean): boolean {
+        const state = this.reconnectState.get(serverId)
+        if (!state) return true
+        if (!explicit && this.isSeriesExhausted(state)) return false
+        return Date.now() - state.lastAttempt >= this.timing.initialBackoffMs
+    }
+
+    private reconnectStateFor (serverId: string): ReconnectState {
+        let state = this.reconnectState.get(serverId)
+        if (!state) {
+            state = { attempts: 0, lastAttempt: 0, backoffMs: this.timing.initialBackoffMs, timeoutId: null }
+            this.reconnectState.set(serverId, state)
+        }
+        return state
+    }
+
+    private isSeriesExhausted (state: ReconnectState): boolean {
+        return state.attempts >= this.timing.maxAttempts
     }
 
     private isSessionError (error: Error): boolean {
@@ -1129,52 +1184,60 @@ class McpProxyService {
     }
 
     private scheduleReconnect (serverId: string): void {
+        if (this.isShutDown) return
+        /* An attempt in flight schedules the next one itself once it has failed; planning
+         * now, from a transport error of that attempt, would use stale bookkeeping */
+        if (this.pendingConnects.has(serverId)) return
         const server = this.serverManager.getServer(serverId)
-        if (!server || !server.enabled) return
-
-        let state = this.reconnectState.get(serverId)
-        if (!state) {
-            state = { attempts: 0, lastAttempt: 0, backoffMs: this.INITIAL_BACKOFF_MS, timeoutId: null }
-            this.reconnectState.set(serverId, state)
+        if (!server || !server.enabled) {
+            /* The series ends with the server; re-enabling it starts from a clean counter */
+            this.cancelReconnect(serverId)
+            return
         }
 
-        if (state.attempts >= this.MAX_RECONNECT_ATTEMPTS) {
-            const timeSinceLastAttempt = Date.now() - state.lastAttempt
-            if (timeSinceLastAttempt < this.COOLDOWN_MS) {
-                logger.debug(`[${this.userId}] MCP server ${server.name}: in cooldown, ${Math.round((this.COOLDOWN_MS - timeSinceLastAttempt) / 1000)}s remaining`)
-                return
-            }
-            logger.info(`[${this.userId}] MCP server ${server.name}: cooldown expired, resetting reconnect attempts`)
-            state.attempts = 0
-            state.backoffMs = this.INITIAL_BACKOFF_MS
-        }
-
+        const state = this.reconnectStateFor(serverId)
         if (state.timeoutId) {
             logger.debug(`[${this.userId}] MCP server ${server.name}: reconnect already scheduled`)
             return
         }
 
-        const backoff = Math.min(state.backoffMs, this.MAX_BACKOFF_MS)
-        logger.info(`[${this.userId}] MCP server ${server.name}: scheduling reconnect in ${backoff / 1000}s (attempt ${state.attempts + 1}/${this.MAX_RECONNECT_ATTEMPTS})`)
+        let delay: number
+        if (this.isSeriesExhausted(state)) {
+            /* Out of attempts: rest until the cooldown is over, then start a new series */
+            delay = Math.max(0, state.lastAttempt + this.timing.cooldownMs - Date.now())
+            logger.warn(`[${this.userId}] MCP server ${server.name}: ${state.attempts} reconnect attempts failed, next try in ${Math.round(delay / 1000)}s`)
+        }
+        else {
+            delay = Math.min(state.backoffMs, this.timing.maxBackoffMs)
+            logger.info(`[${this.userId}] MCP server ${server.name}: scheduling reconnect in ${delay / 1000}s (attempt ${state.attempts + 1}/${this.timing.maxAttempts})`)
+        }
 
         const s = state
         s.timeoutId = setTimeout(async () => {
             s.timeoutId = null
+            if (this.isSeriesExhausted(s)) {
+                s.attempts = 0
+                s.backoffMs = this.timing.initialBackoffMs
+            }
             s.attempts++
-            s.lastAttempt = Date.now()
-            s.backoffMs = Math.min(s.backoffMs * 2, this.MAX_BACKOFF_MS)
+            s.backoffMs = Math.min(s.backoffMs * 2, this.timing.maxBackoffMs)
 
             try {
-                await this.reconnectServer(serverId)
-                this.reconnectState.delete(serverId)
+                /* Not reconnectServer(): that resets the attempt counter, so the backoff
+                 * would never grow and the cooldown would never be reached */
+                await this.restoreConnection(serverId)
                 logger.info(`[${this.userId}] MCP server ${server.name}: reconnected successfully`)
             }
             catch (e) {
-                const msg = getErrorMessage(e)
-                logger.error(`[${this.userId}] MCP server ${server.name}: reconnect failed: ${msg}`)
+                /* Nothing to continue after shutdown, or when another path (an explicit
+                 * reconnect, a successful on-demand one) has ended this series meanwhile */
+                if (this.isShutDown || this.reconnectState.get(serverId) !== s) return
+                /* Taken when the attempt ends, so a slow failure does not eat into the cooldown */
+                s.lastAttempt = Date.now()
+                logger.warn(`[${this.userId}] MCP server ${server.name}: reconnect failed: ${getErrorMessage(e)}`)
                 this.scheduleReconnect(serverId)
             }
-        }, backoff)
+        }, delay)
     }
 
     private cancelReconnect (serverId: string): void {
@@ -1202,6 +1265,11 @@ class McpProxyService {
                 this.taskMapping.delete(taskId)
         }
 
+        await this.disposeConnection(serverId, conn)
+        this.connections.delete(serverId)
+    }
+
+    private async disposeConnection (serverId: string, conn: ServerConnection): Promise<void> {
         if (conn.pingInterval) {
             clearInterval(conn.pingInterval)
             conn.pingInterval = null
@@ -1224,21 +1292,69 @@ class McpProxyService {
                 logger.debug(`[${this.userId}] Error closing client for ${serverId}: ${msg}`)
             }
         }
-
-        this.connections.delete(serverId)
     }
 
+    /* Explicit reconnect (UI, OAuth, session retry): starts over with a clean attempt counter */
     async reconnectServer (serverId: string): Promise<void> {
         const server = this.serverManager.getServer(serverId)
         if (!server) {
             throw new Error(`Server not found: ${serverId}`)
         }
-
         logger.info(`[${this.userId}] Reconnecting MCP server: ${server.name}`)
+        await this.connectFresh(serverId, () => this.cancelReconnect(serverId))
+    }
 
+    /* An attempt already in flight may still use the old configuration (e.g. an expired
+     * OAuth token), so wait until none is running and then connect anew. beforeConnect runs
+     * right before the new attempt starts, with no await in between. */
+    private async connectFresh (serverId: string, beforeConnect?: () => void): Promise<void> {
+        let pending = this.pendingConnects.get(serverId)
+        while (pending) {
+            await pending.catch(() => { /* superseded by the attempt below */ })
+            pending = this.pendingConnects.get(serverId)
+        }
+        beforeConnect?.()
+        try {
+            await this.openConnection(serverId)
+        }
+        catch (error) {
+            this.scheduleReconnect(serverId)
+            throw error
+        }
+    }
+
+    /* Reconnects and, on success, ends any reconnect series for this server */
+    private async restoreConnection (serverId: string): Promise<void> {
+        await this.openConnection(serverId)
         this.cancelReconnect(serverId)
+    }
+
+    /* Single flight: concurrent callers for the same server share one attempt, so a
+     * background reconnect and an on-demand one cannot tear down each other's connection */
+    private openConnection (serverId: string): Promise<void> {
+        const pending = this.pendingConnects.get(serverId)
+        if (pending) return pending
+
+        const attempt = this.replaceConnection(serverId).finally(() => this.pendingConnects.delete(serverId))
+        this.pendingConnects.set(serverId, attempt)
+        return attempt
+    }
+
+    /* Replaces the connection to one server, leaving the reconnect bookkeeping alone */
+    private async replaceConnection (serverId: string): Promise<void> {
+        const server = this.serverManager.getServer(serverId)
+        if (!server) {
+            throw new Error(`Server not found: ${serverId}`)
+        }
         await this.closeConnection(serverId)
-        await this.connectServer(server)
+        const conn = await this.establishConnection(server)
+
+        /* The proxy may have shut down, or the server been disabled or removed, meanwhile */
+        if (this.isShutDown || !this.serverManager.getServer(serverId)?.enabled) {
+            if (this.connections.get(serverId) === conn) await this.closeConnection(serverId)
+            else await this.disposeConnection(serverId, conn)
+            throw new Error(`Connection to ${server.name} discarded: proxy shut down or server disabled or removed meanwhile`)
+        }
     }
 
     async disconnectServer (serverId: string): Promise<void> {
@@ -1422,17 +1538,10 @@ class McpProxyService {
         const state = this.reconnectState.get(serverId)
         if (!state) return "offline"
 
-        if (state.timeoutId) return "reconnecting"
+        /* Out of attempts: the next series only starts after the cooldown */
+        if (this.isSeriesExhausted(state)) return "failed"
 
-        if (state.attempts >= this.MAX_RECONNECT_ATTEMPTS) {
-            const timeSinceLastAttempt = Date.now() - state.lastAttempt
-            if (timeSinceLastAttempt < this.COOLDOWN_MS) {
-                return "failed"
-            }
-            return "reconnecting"
-        }
-
-        if (state.attempts > 0) return "reconnecting"
+        if (state.timeoutId || state.attempts > 0) return "reconnecting"
 
         return "offline"
     }
@@ -1457,7 +1566,7 @@ class McpProxyService {
                 connected: isConnected,
                 connectionState,
                 reconnectAttempts: state?.attempts || 0,
-                maxReconnectAttempts: this.MAX_RECONNECT_ATTEMPTS,
+                maxReconnectAttempts: this.timing.maxAttempts,
                 toolCount: conn?.tools?.length || 0,
                 serverInfo: conn?.serverInfo || null,
                 lastConnected: server.lastConnected,
@@ -1578,4 +1687,5 @@ class McpProxyService {
     }
 }
 
-export { McpProxyService }
+export { McpProxyService, DEFAULT_RECONNECT_TIMING }
+export type { ReconnectTiming }
