@@ -4,9 +4,11 @@
 import { describe, it, before, after } from "node:test"
 import assert from "node:assert/strict"
 import http from "node:http"
+import { Writable } from "node:stream"
 import fs from "fs"
 import path from "path"
 import os from "os"
+import winston from "winston"
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
@@ -16,7 +18,10 @@ import {
 
 import { createApp } from "../src/mcp-funnel-server.js"
 import type { McpFunnelConfig } from "../src/mcp-funnel-config.js"
+import type { McpProxyService } from "../src/mcp-proxy-service.js"
+import logger from "../src/mcp-funnel-log.js"
 import { createSpecServer } from "./fixtures/mcp-spec-server.js"
+import type { SpecServer } from "./fixtures/mcp-spec-server.js"
 
 /* ── helpers ────────────────────────────────────────── */
 
@@ -731,21 +736,30 @@ describe("MCP proxy with a disabled tool", () => {
 
 /* -- I. Two backends with colliding tool names ------------
  * The scenario the qualified-name syntax exists for: the same tool name served by two
- * backends. Unqualified lookups hit whichever connected first; qualified ones must reach
- * exactly the addressed server. */
+ * backends. Unqualified lookups go to the server listed first in the registry, however
+ * often either one reconnects; qualified ones must reach exactly the addressed server. */
 
 describe("MCP proxy with two backends exposing the same tool", () => {
     let tmpDir: string
-    let shutdownA: () => Promise<void>
-    let shutdownB: () => Promise<void>
+    let backendA: SpecServer
+    let backendB: SpecServer
     let funnelShutdown: () => Promise<void>
+    let proxy: McpProxyService
     let client: Client
+    const logLines: string[] = []
+    const logCapture = new winston.transports.Stream({
+        stream: new Writable({
+            write (chunk, _encoding, callback) {
+                logLines.push(String(chunk))
+                callback()
+            }
+        })
+    })
 
     before(async () => {
-        const backendA = await createSpecServer(0)
-        const backendB = await createSpecServer(0)
-        shutdownA = backendA.shutdown
-        shutdownB = backendB.shutdown
+        logger.add(logCapture)
+        backendA = await createSpecServer(0, { name: "alpha" })
+        backendB = await createSpecServer(0, { name: "beta" })
 
         tmpDir = makeTmpDir()
         writeServersConfig(tmpDir, [
@@ -758,15 +772,25 @@ describe("MCP proxy with two backends exposing the same tool", () => {
 
         client = await createTestClient(funnel.baseUrl)
         await new Promise(r => setTimeout(r, 3000))
+        proxy = await funnel.userProxyManager.getProxy("local")
     })
 
     after(async () => {
+        logger.remove(logCapture)
         try { await (client as unknown as { close: () => Promise<void> }).close() } catch { /* ignore */ }
         await funnelShutdown()
-        await shutdownA()
-        await shutdownB()
+        await backendA.shutdown()
+        await backendB.shutdown()
         fs.rmSync(tmpDir, { recursive: true, force: true })
     })
+
+    async function callWhoami (toolName: string): Promise<string> {
+        const result = await client.callTool({
+            name: "mcp_call_tool",
+            arguments: { tool_name: toolName, arguments: {} }
+        })
+        return (result.content as Array<{ type: string; text: string }>)[0].text
+    }
 
     it("discovery lists the shared tool once per server", async () => {
         const result = await client.callTool({
@@ -815,5 +839,78 @@ describe("MCP proxy with two backends exposing the same tool", () => {
             }),
             (err: Error) => err.message.includes("alpha") && err.message.includes("does_not_exist")
         )
+    })
+
+    it("an unqualified name resolves to the server listed first in the registry", async () => {
+        assert.equal(await callWhoami("spec_whoami"), "alpha")
+    })
+
+    it("a session error retries on the same backend, not on another one with the same tool", async () => {
+        const initsBefore = backendA.initCount()
+        await backendA.dropSessions()
+
+        assert.equal(await callWhoami("spec_whoami"), "alpha")
+        assert.equal(backendA.initCount(), initsBefore + 1, "alpha should have been reconnected once")
+    })
+
+    it("an unqualified name keeps its backend after that backend reconnects", async () => {
+        await proxy.reconnectServer("backend-a")
+        assert.equal(await callWhoami("spec_whoami"), "alpha")
+        await proxy.reconnectServer("backend-b")
+        assert.equal(await callWhoami("spec_whoami"), "alpha")
+    })
+
+    it("discovery lists colliding tools in registry order after a reconnect", async () => {
+        await proxy.reconnectServer("backend-a")
+        const result = await client.callTool({
+            name: "mcp_discover_tools",
+            arguments: { words: "spec_whoami", limit: 50 }
+        })
+        const text = (result.content as Array<{ type: string; text: string }>)[0].text
+        const alphaAt = text.indexOf("spec_whoami [alpha]")
+        const betaAt = text.indexOf("spec_whoami [beta]")
+        assert.ok(alphaAt >= 0 && betaAt >= 0, `both entries expected in:\n${text}`)
+        assert.ok(alphaAt < betaAt, `alpha should be listed before beta:\n${text}`)
+    })
+
+    it("the collision warning names the server that gets the unqualified name", async () => {
+        logLines.length = 0
+        await proxy.reconnectServer("backend-a")
+        const warning = logLines.find((l) => l.includes("Tool name collision: \"spec_whoami\""))
+        assert.ok(warning, `no collision warning for spec_whoami in:\n${logLines.join("")}`)
+        assert.ok(warning.includes("provided by both \"alpha\" and \"beta\"; the unqualified name goes to \"alpha\""), warning)
+    })
+
+    it("a tool that is gone after the reconnect fails on its server instead of moving to another one", async () => {
+        backendA.offerWhoami(false)
+        try {
+            await backendA.dropSessions()
+            await assert.rejects(
+                () => callWhoami("spec_whoami"),
+                (err: Error) => err.message.includes("\"spec_whoami\" is no longer offered by server \"alpha\"")
+            )
+        }
+        finally {
+            backendA.offerWhoami(true)
+            await proxy.reconnectServer("backend-a")
+        }
+        assert.equal(await callWhoami("spec_whoami"), "alpha")
+    })
+
+    it("a retry that fails as well reports the retry's error, not the original one", async () => {
+        backendA.failNextToolCalls([
+            { status: 404, body: "Session not found (first attempt)" },
+            { status: 500, body: "backend broken (retry)" }
+        ])
+        try {
+            await assert.rejects(
+                () => callWhoami("spec_whoami"),
+                (err: Error) => err.message.includes("backend broken (retry)") && !err.message.includes("first attempt")
+            )
+        }
+        finally {
+            /* The failed POSTs also scheduled a background reconnect; take it over now */
+            await proxy.reconnectServer("backend-a")
+        }
     })
 })

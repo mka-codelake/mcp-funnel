@@ -68,7 +68,7 @@ interface ReconnectState {
 /* Result of locating a tool. Carries enough context to tell "no such tool anywhere" apart
  * from "that server exists but does not offer this tool", so the caller can report why. */
 type ToolLookup =
-    | { status: "found", serverId: string, tool: ToolWithServer, client: Client }
+    | { status: "found", serverId: string, tool: ToolWithServer, conn: ServerConnection }
     | { status: "server-known-tool-missing", serverName: string, bareName: string }
     | { status: "not-found", toolName: string }
 
@@ -247,25 +247,46 @@ class McpProxyService {
 
     /* Warns when a freshly connected server shadows tool names of another server, or reuses
      * its name. Both make the "<server>:<tool>" form ambiguous, and an unqualified name then
-     * silently resolves to whichever server connected first. */
+     * resolves to whichever of the two servers is listed first in the registry. */
     private warnOnNameCollisions (serverId: string): void {
         const conn = this.connections.get(serverId)
         if (!conn) return
 
+        const order = this.orderedConnections().map(([id]) => id)
         for (const [otherId, other] of this.connections.entries()) {
             if (otherId === serverId) continue
 
             if (other.serverName === conn.serverName) {
-                logger.warn(`[${this.userId}] Duplicate server name "${conn.serverName}" (ids ${serverId} and ${otherId}). Qualified tool names are ambiguous; the first match wins.`)
+                logger.warn(`[${this.userId}] Duplicate server name "${conn.serverName}" (ids ${serverId} and ${otherId}). Qualified tool names are ambiguous; they resolve to the server listed first in the registry.`)
             }
 
+            const [winner, loser] = order.indexOf(otherId) < order.indexOf(serverId) ? [other, conn] : [conn, other]
             const otherNames = new Set(other.tools.map((t) => t.name))
             for (const tool of conn.tools) {
                 if (otherNames.has(tool.name)) {
-                    logger.warn(`[${this.userId}] Tool name collision: "${tool.name}" is provided by both "${other.serverName}" and "${conn.serverName}". Use "<server>:${tool.name}" to disambiguate.`)
+                    logger.warn(`[${this.userId}] Tool name collision: "${tool.name}" is provided by both "${winner.serverName}" and "${loser.serverName}"; the unqualified name goes to "${winner.serverName}". Use "<server>:${tool.name}" to disambiguate.`)
                 }
             }
         }
+    }
+
+    /* Connected servers in registry order. The insertion order of the connections map changes
+     * with every reconnect, so it must not decide which backend an ambiguous name reaches.
+     * Connections without a registry entry (removed while connected) come last. */
+    private orderedConnections (): Array<[string, ServerConnection]> {
+        const ordered: Array<[string, ServerConnection]> = []
+        const seen = new Set<string>()
+        for (const server of this.serverManager.getServers()) {
+            const conn = this.connections.get(server.id)
+            if (conn) {
+                ordered.push([server.id, conn])
+                seen.add(server.id)
+            }
+        }
+        for (const entry of this.connections.entries()) {
+            if (!seen.has(entry[0])) ordered.push(entry)
+        }
+        return ordered
     }
 
     private findConnectionByClient (client: Client): { serverId: string; serverName: string; conn: ServerConnection } | undefined {
@@ -936,7 +957,7 @@ class McpProxyService {
 
     getAllToolsInternal (): ToolWithServer[] {
         const allTools: ToolWithServer[] = []
-        for (const [serverId, conn] of this.connections.entries()) {
+        for (const [serverId, conn] of this.orderedConnections()) {
             allTools.push(...this.getEnabledTools(serverId, conn.tools))
         }
         return allTools
@@ -1045,7 +1066,7 @@ class McpProxyService {
      * which is the pre-existing behaviour. getToolSchema, in contrast, hides them. */
     private findToolServer (toolName: string): ToolLookup {
         const allTools: ToolWithServer[] = []
-        for (const conn of this.connections.values()) {
+        for (const [, conn] of this.orderedConnections()) {
             allTools.push(...conn.tools)
         }
 
@@ -1055,7 +1076,7 @@ class McpProxyService {
         const conn = this.connections.get(resolution.tool._serverId)
         if (!conn) return { status: "not-found", toolName }
 
-        return { status: "found", serverId: resolution.tool._serverId, tool: resolution.tool, client: conn.client }
+        return { status: "found", serverId: resolution.tool._serverId, tool: resolution.tool, conn }
     }
 
     private async tryReconnectForTool (toolName: string, onlyServerId?: string): Promise<ToolLookup> {
@@ -1250,51 +1271,71 @@ class McpProxyService {
             }
         }
 
-        const { client, serverId, tool } = lookup
+        const { conn, serverId, tool } = lookup
+        const target = `${toolName} on ${conn.serverName}`
 
         try {
-            const callParams: Record<string, unknown> = {
-                /* The backend only knows the unqualified name. Everything else - logging,
-                 * the retry below, error messages - keeps the name as the caller wrote it. */
-                name: tool.name,
-                arguments: args
-            }
-            if (taskMeta) {
-                callParams.task = taskMeta
-            }
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const result = await client.callTool(callParams as any)
-
-            /* If backend returned a CreateTaskResult, map the task ID */
-            if (result && typeof result === "object" && "task" in result) {
-                const task = (result as Record<string, unknown>).task as Record<string, unknown> | undefined
-                if (task?.taskId) {
-                    this.taskMapping.set(String(task.taskId), { serverId, backendTaskId: String(task.taskId) })
-                    logger.debug(`[${this.userId}] Task created for ${toolName}: ${task.taskId}`)
-                }
-            }
-
-            return result
+            return await this.invokeTool(serverId, conn, tool, args, toolName, taskMeta)
         }
         catch (error) {
             const msg = getErrorMessage(error)
-            logger.error(`[${this.userId}] Tool call failed (${toolName}): ${msg}`)
-
-            if (retryOnSessionError && error instanceof Error && this.isSessionError(error)) {
-                logger.info(`[${this.userId}] Session error detected, attempting reconnection for tool: ${toolName}`)
-                try {
-                    await this.reconnectServer(serverId)
-                    return await this.callTool(toolName, args, false, taskMeta)
-                }
-                catch (reconnectError) {
-                    const rmsg = getErrorMessage(reconnectError)
-                    logger.error(`[${this.userId}] Reconnection failed: ${rmsg}`)
-                    throw error
-                }
+            if (!retryOnSessionError || !(error instanceof Error) || !this.isSessionError(error)) {
+                logger.error(`[${this.userId}] Tool call failed (${target}): ${msg}`)
+                throw error
             }
 
-            throw error
+            /* Retry on the same backend. Resolving the name again could land on another
+             * server: an ambiguous name may now match a different backend first. */
+            logger.warn(`[${this.userId}] Tool call failed (${target}): ${msg} - session error, reconnecting and retrying`)
+            try {
+                await this.reconnectServer(serverId)
+            }
+            catch (reconnectError) {
+                logger.error(`[${this.userId}] Reconnection failed (${target}): ${getErrorMessage(reconnectError)}`)
+                throw error
+            }
+
+            const retryConn = this.connections.get(serverId)
+            const retryTool = retryConn?.tools.find((t) => t.name === tool.name)
+            if (!retryConn || !retryTool) {
+                const goneMsg = `Tool "${tool.name}" is no longer offered by server "${conn.serverName}" after reconnecting`
+                logger.error(`[${this.userId}] Tool call failed after reconnect (${target}): ${goneMsg}`)
+                throw new Error(goneMsg)
+            }
+
+            try {
+                return await this.invokeTool(serverId, retryConn, retryTool, args, toolName, taskMeta)
+            }
+            catch (retryError) {
+                logger.error(`[${this.userId}] Tool call failed after reconnect (${target}): ${getErrorMessage(retryError)}`)
+                throw retryError
+            }
         }
+    }
+
+    /* Sends one tool call to one specific backend. The backend only knows the unqualified
+     * name; requestedName is the name as the client wrote it, used for logging only. */
+    private async invokeTool (serverId: string, conn: ServerConnection, tool: ToolWithServer, args: Record<string, unknown>, requestedName: string, taskMeta?: Record<string, unknown>): Promise<unknown> {
+        const callParams: Record<string, unknown> = {
+            name: tool.name,
+            arguments: args
+        }
+        if (taskMeta) {
+            callParams.task = taskMeta
+        }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const result = await conn.client.callTool(callParams as any)
+
+        /* If backend returned a CreateTaskResult, map the task ID */
+        if (result && typeof result === "object" && "task" in result) {
+            const task = (result as Record<string, unknown>).task as Record<string, unknown> | undefined
+            if (task?.taskId) {
+                this.taskMapping.set(String(task.taskId), { serverId, backendTaskId: String(task.taskId) })
+                logger.debug(`[${this.userId}] Task created for ${requestedName} on ${conn.serverName}: ${task.taskId}`)
+            }
+        }
+
+        return result
     }
 
     private async getAllPrompts (): Promise<unknown[]> {
