@@ -6,20 +6,47 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js"
 import { z } from "zod"
 
-export async function createSpecServer (port?: number): Promise<{
+export interface SpecServerOptions {
+    /* Returned by spec_whoami, so a test can tell which backend answered a call */
+    name?: string
+}
+
+export interface SpecServer {
     url: string
     httpServer: http.Server
-    mcpServer: McpServer
+    /* Closes and forgets all sessions, as a backend restart would. The next request on an
+     * old session id gets a 404 "Session not found". */
+    dropSessions: () => Promise<void>
+    /* Number of initialize requests served so far */
+    initCount: () => number
+    /* Whether sessions initialized from now on offer spec_whoami */
+    offerWhoami: (offered: boolean) => void
+    /* Answers the next tools/call requests with these HTTP errors, one per request */
+    failNextToolCalls: (failures: Array<{ status: number, body: string }>) => void
     shutdown: () => Promise<void>
-}> {
+}
+
+function createMcpServer (name: string, withWhoami: boolean): McpServer {
     const server = new McpServer(
         { name: "mcp-spec-test-server", version: "1.0.0" },
         { capabilities: { logging: {} } }
     )
 
-    registerTools(server)
+    registerTools(server, name, withWhoami)
     registerResources(server)
     registerPrompts(server)
+    return server
+}
+
+export async function createSpecServer (port?: number, options: SpecServerOptions = {}): Promise<SpecServer> {
+    const name = options.name ?? "spec"
+    let inits = 0
+    let withWhoami = true
+    const pendingFailures: Array<{ status: number, body: string }> = []
+
+    /* One McpServer per session: a Protocol instance can only serve a single transport,
+     * so a client that reconnects needs a fresh one. */
+    const servers = new Set<McpServer>()
 
     /* HTTP wrapper with StreamableHTTP transport */
     const transports = new Map<string, StreamableHTTPServerTransport>()
@@ -51,6 +78,9 @@ export async function createSpecServer (port?: number): Promise<{
             const isInit = body && typeof body === "object" && !Array.isArray(body) && (body as Record<string, unknown>).method === "initialize"
 
             if (isInit) {
+                inits++
+                const server = createMcpServer(name, withWhoami)
+                servers.add(server)
                 const transport = new StreamableHTTPServerTransport({
                     sessionIdGenerator: () => crypto.randomUUID(),
                     enableJsonResponse: true,
@@ -61,6 +91,7 @@ export async function createSpecServer (port?: number): Promise<{
                 transport.onclose = () => {
                     const sid = transport.sessionId
                     if (sid) transports.delete(sid)
+                    servers.delete(server)
                 }
                 await server.server.connect(transport)
                 await transport.handleRequest(rawReq, res, body)
@@ -69,6 +100,13 @@ export async function createSpecServer (port?: number): Promise<{
 
             /* Non-initialize POST: look up session */
             const sessionId = req.headers["mcp-session-id"] as string | undefined
+            const isToolCall = body && typeof body === "object" && !Array.isArray(body) && (body as Record<string, unknown>).method === "tools/call"
+            const failure = isToolCall ? pendingFailures.shift() : undefined
+            if (failure) {
+                res.writeHead(failure.status, { "Content-Type": "text/plain" })
+                res.end(failure.body)
+                return
+            }
             if (sessionId && transports.has(sessionId)) {
                 await transports.get(sessionId)!.handleRequest(rawReq, res, body)
                 return
@@ -100,19 +138,45 @@ export async function createSpecServer (port?: number): Promise<{
     const addr = httpServer.address() as { port: number }
     const url = `http://127.0.0.1:${addr.port}/mcp`
 
-    const shutdown = async () => {
-        for (const transport of transports.values()) {
+    const dropSessions = async () => {
+        const open = [...transports.values()]
+        transports.clear()
+        for (const transport of open) {
             try { await transport.close() } catch { /* ignore */ }
         }
-        transports.clear()
-        await server.close()
+    }
+
+    const shutdown = async () => {
+        await dropSessions()
+        for (const server of servers) {
+            try { await server.close() } catch { /* ignore */ }
+        }
+        servers.clear()
         await new Promise<void>((resolve) => httpServer.close(() => resolve()))
     }
 
-    return { url, httpServer, mcpServer: server, shutdown }
+    return {
+        url,
+        httpServer,
+        dropSessions,
+        initCount: () => inits,
+        offerWhoami: (offered) => { withWhoami = offered },
+        failNextToolCalls: (failures) => { pendingFailures.push(...failures) },
+        shutdown
+    }
 }
 
-function registerTools (server: McpServer): void {
+function registerTools (server: McpServer, name: string, withWhoami: boolean): void {
+    /* spec_whoami — names the backend instance that served the call */
+    if (withWhoami) {
+        server.registerTool("spec_whoami", {
+            description: "Returns the name of the backend instance",
+            annotations: { readOnlyHint: true }
+        }, async () => {
+            return { content: [{ type: "text", text: name }] }
+        })
+    }
+
     /* spec_echo — basic tool with string input */
     server.registerTool("spec_echo", {
         description: "Echoes the input message back",
