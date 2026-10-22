@@ -4,10 +4,12 @@
  * 100% AI-generated code (agentic coding with Claude Code) */
 
 import { randomUUID } from "node:crypto"
+import { setMaxListeners } from "node:events"
+import { setTimeout as delay } from "node:timers/promises"
 import type { IncomingMessage, ServerResponse } from "node:http"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js"
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
+import { SSEClientTransport, SseError } from "@modelcontextprotocol/sdk/client/sse.js"
+import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js"
@@ -27,7 +29,9 @@ import {
     GetTaskPayloadRequestSchema, GetTaskPayloadResultSchema,
     ListTasksRequestSchema, ListTasksResultSchema,
     CancelTaskRequestSchema, CancelTaskResultSchema,
-    TaskStatusNotificationSchema
+    TaskStatusNotificationSchema,
+    ErrorCode,
+    McpError
 } from "@modelcontextprotocol/sdk/types.js"
 import logger from "./mcp-funnel-log.js"
 import { VERSION, getErrorMessage } from "./utils.js"
@@ -48,6 +52,14 @@ interface ServerConnection {
     serverInfo: { name?: string; version?: string } | undefined
     capabilities: Record<string, unknown> | undefined
     pingInterval: ReturnType<typeof setInterval> | null
+    /* The transport is dead (stream ended, session gone, backend down). The entry stays so
+     * that its tools remain resolvable; calls reconnect before using it. */
+    stale: boolean
+    /* Closed on purpose; its transport's onclose must not count as a lost connection */
+    closing: boolean
+    /* Tool calls in flight. Aborted when the connection is disposed: the SDK keeps a
+     * request's timeout timer alive after the transport closed unless it is cancelled. */
+    inFlight: Set<AbortController>
 }
 
 interface InboundSessionEntry {
@@ -63,24 +75,134 @@ interface ReconnectState {
     lastAttempt: number
     backoffMs: number
     timeoutId: ReturnType<typeof setTimeout> | null
+    /* Calls waiting for this server share one retry schedule: no attempt before retryAt */
+    retryAt: number
+    retryWaitMs: number
 }
 
 /* Background reconnect after a backend dropped: the wait doubles from initialBackoffMs up to
  * maxBackoffMs. After maxAttempts failures the server rests for cooldownMs, then a new series
  * starts. initialBackoffMs is also the minimum gap between on-demand reconnects that client
- * calls trigger. Configurable so tests do not have to wait minutes. */
+ * calls trigger. A tool call on a lost connection waits up to connectWaitMs for the backend,
+ * trying again after connectRetryMs, doubling. SSE connections are pinged every
+ * pingIntervalMs. Configurable so tests do not have to wait. */
 interface ReconnectTiming {
     maxAttempts: number
     initialBackoffMs: number
     maxBackoffMs: number
     cooldownMs: number
+    connectWaitMs: number
+    connectRetryMs: number
+    pingIntervalMs: number
 }
 
+/* connectWaitMs: twice the longest restart measured for the SSE backends of a typical
+ * setup (docker restart until the endpoint answers: 1.5-10.6 s) */
 const DEFAULT_RECONNECT_TIMING: ReconnectTiming = {
     maxAttempts: 5,
     initialBackoffMs: 5000,
     maxBackoffMs: 300000,
-    cooldownMs: 600000
+    cooldownMs: 600000,
+    connectWaitMs: 20000,
+    connectRetryMs: 500,
+    pingIntervalMs: 30000
+}
+
+/* Whether a failed request can have reached the backend. "not-sent" requests may always be
+ * repeated after reconnecting, "maybe-executed" ones only for tools that declare themselves
+ * read-only or idempotent; "other" failures are answers, not connection problems. */
+type CallFailure = "not-sent" | "maybe-executed" | "other"
+
+/* Network errors before the request left this host */
+const NOT_SENT_NET_CODES = ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"]
+/* Network errors while the request may already have been processed */
+const MAYBE_EXECUTED_NET_CODES = ["ECONNRESET", "UND_ERR_SOCKET", "EPIPE"]
+/* HTTP status of a rejected message POST: the session is gone (404) or the backend did not
+ * take the request (503). A gateway error (502, 504) leaves open what happened behind it. */
+const NOT_SENT_HTTP_STATUS = [404, 503]
+const MAYBE_EXECUTED_HTTP_STATUS = [502, 504]
+/* Messages of a broken connection whose cause is unknown */
+const BROKEN_CONNECTION_TEXT = ["terminated", "other side closed", "fetch failed"]
+const MAX_ERROR_CHAIN = 10
+
+/* The error with its causes; undici reports network errors as TypeError("fetch failed")
+ * with the actual error, sometimes an AggregateError, as cause */
+function errorChain (error: unknown): Array<{ message: string, code: unknown }> {
+    const chain: Array<{ message: string, code: unknown }> = []
+    const pending: unknown[] = [error]
+    while (pending.length > 0 && chain.length < MAX_ERROR_CHAIN) {
+        const e = pending.shift()
+        if (!e || typeof e !== "object") continue
+        const { message, code, cause, errors } = e as { message?: unknown, code?: unknown, cause?: unknown, errors?: unknown }
+        chain.push({ message: typeof message === "string" ? message : "", code })
+        if (cause) pending.push(cause)
+        if (Array.isArray(errors)) pending.push(...errors)
+    }
+    return chain
+}
+
+/* HTTP status of a failed transport request. SSEClientTransport.send() throws a plain
+ * Error that carries it only in the text: "Error POSTing to endpoint (HTTP 404): ..." */
+function httpStatusOf (error: unknown): number | undefined {
+    if (error instanceof StreamableHTTPError || error instanceof SseError) {
+        return typeof error.code === "number" ? error.code : undefined
+    }
+    const match = /error posting to endpoint \(http (\d{3})\)/i.exec(error instanceof Error ? error.message : "")
+    return match ? Number(match[1]) : undefined
+}
+
+function mentionsAny (text: string, needles: readonly string[]): boolean {
+    return needles.some((n) => text.includes(n.toLowerCase()))
+}
+
+function classifyFailure (error: unknown): CallFailure {
+    /* An McpError is an answer: a JSON-RPC error from the backend or a local timeout. Its
+     * text must not be read for connection problems. The one exception is the SDK's own
+     * "Connection closed" for requests in flight when the transport closes. */
+    if (error instanceof McpError) {
+        return error.code === ErrorCode.ConnectionClosed && /connection closed$/i.test(error.message) ? "maybe-executed" : "other"
+    }
+
+    const chain = errorChain(error)
+    const codes = chain.map((e) => String(e.code))
+    const text = chain.map((e) => e.message).join(" ").toLowerCase()
+    const status = httpStatusOf(error)
+
+    if (codes.some((c) => NOT_SENT_NET_CODES.includes(c)) || mentionsAny(text, NOT_SENT_NET_CODES)
+        || text.includes("not connected")
+        || (status !== undefined && NOT_SENT_HTTP_STATUS.includes(status))
+        || (status === 400 && text.includes("session"))) {
+        return "not-sent"
+    }
+    if (codes.some((c) => MAYBE_EXECUTED_NET_CODES.includes(c)) || mentionsAny(text, MAYBE_EXECUTED_NET_CODES)
+        || mentionsAny(text, BROKEN_CONNECTION_TEXT)
+        || (status !== undefined && MAYBE_EXECUTED_HTTP_STATUS.includes(status))) {
+        return "maybe-executed"
+    }
+    return "other"
+}
+
+/* A transport-level failure of an established connection: the connection is unusable */
+function isConnectionFailure (error: unknown): boolean {
+    return error instanceof SseError || error instanceof StreamableHTTPError
+        || httpStatusOf(error) !== undefined || classifyFailure(error) !== "other"
+}
+
+/* A failed connection attempt that may well succeed shortly: the backend is not listening
+ * yet, or a gateway in front of it is not ready. Not an authentication or URL problem. */
+function isWorthWaitingFor (error: unknown): boolean {
+    if (error instanceof SseError) return error.code === undefined || error.code >= 500
+    if (error instanceof StreamableHTTPError) return [502, 503, 504].includes(error.code ?? 0)
+    return classifyFailure(error) !== "other"
+}
+
+/* A call may be repeated after a connection loss mid-call only if the tool says so */
+function isRepeatable (tool: ToolWithServer): boolean {
+    return tool.annotations?.readOnlyHint === true || tool.annotations?.idempotentHint === true
+}
+
+function seconds (ms: number): string {
+    return `${(ms / 1000).toFixed(1)}s`
 }
 
 /* Result of locating a tool. Carries enough context to tell "no such tool anywhere" apart
@@ -132,12 +254,13 @@ class McpProxyService {
     private taskMapping = new Map<string, { serverId: string; backendTaskId: string }>()
     private sessionCleanupTimer: ReturnType<typeof setInterval> | null = null
     private isShutDown = false
+    /* Aborted by shutdown(); ends the waits of calls for a reconnect */
+    private readonly shutdownSignal = new AbortController()
 
     /* serverId → connection attempt in flight; callers for the same server share it */
     private pendingConnects = new Map<string, Promise<void>>()
 
     private readonly timing: ReconnectTiming
-    private readonly PING_INTERVAL = 30000
 
     /* 30 minutes */
     private readonly SESSION_IDLE_TTL = 30 * 60 * 1000
@@ -151,6 +274,8 @@ class McpProxyService {
         this.serverManager = serverManager
         this.userId = userId
         this.timing = { ...DEFAULT_RECONNECT_TIMING, ...timing }
+        /* Every call waiting for a reconnect listens on it */
+        setMaxListeners(0, this.shutdownSignal.signal)
     }
 
     async initialize (): Promise<void> {
@@ -652,6 +777,7 @@ class McpProxyService {
         /* A reconnect attempt already in flight must neither schedule the next one
          * nor keep the connection it opens */
         this.isShutDown = true
+        this.shutdownSignal.abort()
         if (this.sessionCleanupTimer) {
             clearInterval(this.sessionCleanupTimer)
             this.sessionCleanupTimer = null
@@ -732,6 +858,12 @@ class McpProxyService {
             }
         )
 
+        /* Set once the connection is established. Handlers of a transport that is still
+         * connecting, or that has been replaced by a newer connection, must not touch the
+         * connection that is current for this server. */
+        let own: ServerConnection | undefined
+        const isCurrent = (): boolean => own !== undefined && this.connections.get(server.id) === own
+
         transport.onerror = (error: Error) => {
             if (this.isShutDown) return
             const msg = error.message || ""
@@ -743,22 +875,33 @@ class McpProxyService {
                 return
             }
 
+            if (own === undefined) {
+                /* Still connecting: the attempt reports its own failure */
+                logger.debug(`[${this.userId}] MCP transport error while connecting to ${server.name}: ${msg}`)
+                this.serverManager.updateConnectionStatus(server.id, false, msg)
+                return
+            }
+            if (!isCurrent()) {
+                logger.debug(`[${this.userId}] MCP transport error of a replaced connection to ${server.name}: ${msg}`)
+                return
+            }
+
+            if (isConnectionFailure(error)) {
+                this.markStale(server.id, own, msg)
+                return
+            }
             logger.error(`[${this.userId}] MCP transport error for ${server.name}: ${msg}`)
             this.serverManager.updateConnectionStatus(server.id, false, msg)
-
-            if (this.isSessionError(error)) {
-                this.scheduleReconnect(server.id)
-            }
         }
 
         transport.onclose = () => {
-            logger.info(`[${this.userId}] MCP connection closed: ${server.name}`)
-            const conn = this.connections.get(server.id)
-            if (conn?.pingInterval) {
-                clearInterval(conn.pingInterval)
-                conn.pingInterval = null
+            if (!own || !isCurrent() || own.closing || own.stale) {
+                logger.debug(`[${this.userId}] MCP transport closed: ${server.name}`)
+                return
             }
-            this.connections.delete(server.id)
+            /* Closed by the other side, e.g. a stdio backend that exited */
+            logger.info(`[${this.userId}] MCP connection closed: ${server.name}`)
+            this.markStale(server.id, own, "connection closed by the backend")
         }
 
         try {
@@ -791,8 +934,11 @@ class McpProxyService {
                     catch (err) {
                         const msg = getErrorMessage(err)
                         logger.warn(`[${this.userId}] Keep-alive ping failed for ${server.name}: ${msg}`)
+                        /* Usually the transport's onerror has marked it already; this also
+                         * covers failures that do not pass through onerror */
+                        if (own && isCurrent() && isConnectionFailure(err)) this.markStale(server.id, own, msg)
                     }
-                }, this.PING_INTERVAL)
+                }, this.timing.pingIntervalMs)
             }
 
             const conn: ServerConnection = {
@@ -802,8 +948,15 @@ class McpProxyService {
                 serverName: server.name,
                 serverInfo: serverInfo as { name?: string; version?: string } | undefined,
                 capabilities: capabilities as Record<string, unknown> | undefined,
-                pingInterval
+                pingInterval,
+                stale: false,
+                closing: false,
+                inFlight: new Set()
             }
+            own = conn
+            /* Same turn as the swap, so no call on the new connection can register a task
+             * or resource in between and lose it */
+            if (this.connections.has(server.id)) this.forgetServerReferences(server.id)
             this.connections.set(server.id, conn)
 
             this.serverManager.updateConnectionStatus(server.id, true)
@@ -1021,7 +1174,13 @@ class McpProxyService {
 
     private isServerConnected (serverName: string): boolean {
         const id = this.serverIdByName(serverName)
-        return id !== undefined && this.connections.has(id)
+        return id !== undefined && this.isLive(id)
+    }
+
+    /* Connected and usable; a lost connection that is still listed does not count */
+    private isLive (serverId: string): boolean {
+        const conn = this.connections.get(serverId)
+        return conn !== undefined && !conn.stale
     }
 
     private getToolSchema (toolName: string) {
@@ -1091,7 +1250,7 @@ class McpProxyService {
         return {
             tools,
             disabledTools: disabledToolsList,
-            connected: true,
+            connected: !conn.stale,
             serverInfo: conn.serverInfo
         }
     }
@@ -1118,7 +1277,7 @@ class McpProxyService {
         const servers = this.serverManager.getEnabledServers()
 
         for (const server of servers) {
-            if (this.connections.has(server.id)) continue
+            if (this.isLive(server.id)) continue
             if (onlyServerId && server.id !== onlyServerId) continue
             if (!this.mayReconnectOnDemand(server.id, onlyServerId !== undefined)) continue
 
@@ -1156,7 +1315,7 @@ class McpProxyService {
     private reconnectStateFor (serverId: string): ReconnectState {
         let state = this.reconnectState.get(serverId)
         if (!state) {
-            state = { attempts: 0, lastAttempt: 0, backoffMs: this.timing.initialBackoffMs, timeoutId: null }
+            state = { attempts: 0, lastAttempt: 0, backoffMs: this.timing.initialBackoffMs, timeoutId: null, retryAt: 0, retryWaitMs: 0 }
             this.reconnectState.set(serverId, state)
         }
         return state
@@ -1166,21 +1325,92 @@ class McpProxyService {
         return state.attempts >= this.timing.maxAttempts
     }
 
-    private isSessionError (error: Error): boolean {
-        const msg = (error.message || "").toLowerCase()
-        return msg.includes("session")
-               || msg.includes("no valid session")
-               || msg.includes("session expired")
-               || msg.includes("session not found")
-               || msg.includes("connection closed")
-               || msg.includes("stream disconnected")
-               || msg.includes("terminated")
-               || msg.includes("streamable http error")
-               || msg.includes("error posting to endpoint")
-               || msg.includes("econnrefused")
-               || msg.includes("econnreset")
-               || msg.includes("enotfound")
-               || msg.includes("fetch failed")
+    /* The connection is dead but stays listed with its tools, so calls can wait for the
+     * reconnect instead of failing with "tool not found". Ignores replaced connections. */
+    private markStale (serverId: string, conn: ServerConnection, reason: string): void {
+        if (this.connections.get(serverId) !== conn || conn.stale) return
+        conn.stale = true
+        logger.warn(`[${this.userId}] MCP connection to ${conn.serverName} lost: ${reason}`)
+        this.serverManager.updateConnectionStatus(serverId, false, reason)
+        /* Closed on the next turn: called from a transport's onerror, closing right away would
+         * fail the request in flight with "Connection closed" instead of its real error */
+        setImmediate(() => {
+            this.disposeConnection(serverId, conn).catch(() => { /* disposeConnection logs itself */ })
+        })
+        this.scheduleReconnect(serverId)
+    }
+
+    /* A live connection to this server. Reconnects a lost one and, unless the server rests
+     * after a failed series, waits up to connectWaitMs for a backend that is starting up.
+     * Waiting calls share one retry schedule per server (retryAt) and their attempts are
+     * single-flight, so many waiting calls do not mean many connection attempts. */
+    private async ensureConnected (serverId: string, target: string): Promise<ServerConnection> {
+        const started = Date.now()
+        const deadline = started + this.timing.connectWaitMs
+        let attempts = 0
+        let lastError: unknown
+        let announced = false
+        const announce = () => {
+            if (announced) return
+            announced = true
+            logger.info(`[${this.userId}] Waiting up to ${seconds(this.timing.connectWaitMs)} for the connection (${target})`)
+        }
+        /* Several waiting calls may see the same failed attempt; the first one sets the
+         * next retry, the others follow it */
+        const postponeRetry = () => {
+            const state = this.reconnectStateFor(serverId)
+            if (state.retryAt > Date.now()) return
+            state.retryWaitMs = state.retryWaitMs === 0 ? this.timing.connectRetryMs : Math.min(state.retryWaitMs * 2, this.timing.connectRetryMs * 8)
+            state.retryAt = Date.now() + state.retryWaitMs
+        }
+
+        for (;;) {
+            const conn = this.connections.get(serverId)
+            if (conn && !conn.stale) return conn
+            if (this.isShutDown) throw new Error("MCP proxy is shutting down")
+
+            const state = this.reconnectStateFor(serverId)
+            const now = Date.now()
+            if (now < state.retryAt) {
+                if (state.retryAt >= deadline) break
+                announce()
+                await this.waitUnlessShutDown(state.retryAt - now)
+                continue
+            }
+            if (attempts > 0 && now >= deadline) break
+
+            const resting = this.isSeriesExhausted(state)
+            attempts++
+            try {
+                await this.restoreConnection(serverId)
+                /* Up, but lost again at once: pace the next attempt like a failed one */
+                if (!this.isLive(serverId)) postponeRetry()
+            }
+            catch (error) {
+                lastError = error
+                if (this.isShutDown || resting || !isWorthWaitingFor(error)) break
+                postponeRetry()
+                announce()
+            }
+        }
+
+        if (attempts > 0) this.reconnectStateFor(serverId).lastAttempt = Date.now()
+        this.scheduleReconnect(serverId)
+        if (attempts === 0) {
+            const due = Math.max(0, this.reconnectStateFor(serverId).retryAt - Date.now())
+            throw new Error(`no attempt within the ${seconds(this.timing.connectWaitMs)} wait: the next one is due in ${seconds(due)}`)
+        }
+        const reason = lastError === undefined ? "the connection was established but lost again at once" : getErrorMessage(lastError)
+        throw new Error(`not reachable after ${Date.now() - started} ms and ${attempts} attempt(s): ${reason}`, lastError === undefined ? undefined : { cause: lastError })
+    }
+
+    private async waitUnlessShutDown (ms: number): Promise<void> {
+        try {
+            await delay(ms, undefined, { signal: this.shutdownSignal.signal })
+        }
+        catch {
+            /* Aborted by shutdown(); the caller checks isShutDown */
+        }
     }
 
     private scheduleReconnect (serverId: string): void {
@@ -1190,8 +1420,10 @@ class McpProxyService {
         if (this.pendingConnects.has(serverId)) return
         const server = this.serverManager.getServer(serverId)
         if (!server || !server.enabled) {
-            /* The series ends with the server; re-enabling it starts from a clean counter */
+            /* The series ends with the server; re-enabling it starts from a clean counter.
+             * A lost connection to it would otherwise stay listed for good. */
             this.cancelReconnect(serverId)
+            if (this.connections.get(serverId)?.stale) this.closeConnection(serverId).catch(() => { /* logged by disposeConnection */ })
             return
         }
 
@@ -1203,9 +1435,11 @@ class McpProxyService {
 
         let delay: number
         if (this.isSeriesExhausted(state)) {
-            /* Out of attempts: rest until the cooldown is over, then start a new series */
+            /* Out of attempts: rest until the cooldown is over, then start a new series. The
+             * tools of a lost connection disappear now instead of making calls wait in vain. */
             delay = Math.max(0, state.lastAttempt + this.timing.cooldownMs - Date.now())
             logger.warn(`[${this.userId}] MCP server ${server.name}: ${state.attempts} reconnect attempts failed, next try in ${Math.round(delay / 1000)}s`)
+            if (this.connections.get(serverId)?.stale) this.closeConnection(serverId).catch(() => { /* logged by disposeConnection */ })
         }
         else {
             delay = Math.min(state.backoffMs, this.timing.maxBackoffMs)
@@ -1252,24 +1486,27 @@ class McpProxyService {
     private async closeConnection (serverId: string): Promise<void> {
         const conn = this.connections.get(serverId)
         if (!conn) return
-
-        /* Clean up resource ownership entries for this server */
-        for (const [uri, owner] of this.resourceOwners.entries()) {
-            if (owner === serverId)
-                this.resourceOwners.delete(uri)
-        }
-
-        /* Clean up task mappings for this server */
-        for (const [taskId, mapping] of this.taskMapping.entries()) {
-            if (mapping.serverId === serverId)
-                this.taskMapping.delete(taskId)
-        }
-
-        await this.disposeConnection(serverId, conn)
         this.connections.delete(serverId)
+        this.forgetServerReferences(serverId)
+        await this.disposeConnection(serverId, conn)
+    }
+
+    /* Resource owners and backend task ids point to a server, not to one connection. They
+     * are dropped whenever the connection to the server goes away or gets replaced. */
+    private forgetServerReferences (serverId: string): void {
+        for (const [uri, owner] of this.resourceOwners.entries()) {
+            if (owner === serverId) this.resourceOwners.delete(uri)
+        }
+        for (const [taskId, mapping] of this.taskMapping.entries()) {
+            if (mapping.serverId === serverId) this.taskMapping.delete(taskId)
+        }
     }
 
     private async disposeConnection (serverId: string, conn: ServerConnection): Promise<void> {
+        conn.closing = true
+        const closed = new McpError(ErrorCode.ConnectionClosed, "Connection closed")
+        for (const controller of conn.inFlight) controller.abort(closed)
+        conn.inFlight.clear()
         if (conn.pingInterval) {
             clearInterval(conn.pingInterval)
             conn.pingInterval = null
@@ -1340,14 +1577,17 @@ class McpProxyService {
         return attempt
     }
 
-    /* Replaces the connection to one server, leaving the reconnect bookkeeping alone */
+    /* Replaces the connection to one server, leaving the reconnect bookkeeping alone. The new
+     * connection is built first: until it is up, the old entry (possibly a lost one) stays,
+     * so its tools remain resolvable, and a failed attempt leaves things as they were. */
     private async replaceConnection (serverId: string): Promise<void> {
         const server = this.serverManager.getServer(serverId)
         if (!server) {
             throw new Error(`Server not found: ${serverId}`)
         }
-        await this.closeConnection(serverId)
+        const previous = this.connections.get(serverId)
         const conn = await this.establishConnection(server)
+        if (previous) await this.disposeConnection(serverId, previous)
 
         /* The proxy may have shut down, or the server been disabled or removed, meanwhile */
         if (this.isShutDown || !this.serverManager.getServer(serverId)?.enabled) {
@@ -1362,6 +1602,8 @@ class McpProxyService {
         await this.closeConnection(serverId)
     }
 
+    /* retryOnSessionError only decides whether a call that failed on a lost connection is
+     * repeated. A connection already known to be lost is rebuilt before the call either way. */
     async callTool (toolName: string, args: Record<string, unknown>, retryOnSessionError = true, taskMeta?: Record<string, unknown>): Promise<unknown> {
         let lookup = this.findToolServer(toolName)
 
@@ -1370,12 +1612,13 @@ class McpProxyService {
             /* The prefix names a configured server. If that server is connected, the tool
              * genuinely does not exist there and reconnecting others would not help. */
             const targetId = this.serverIdByName(serverName)
-            const wasConnected = targetId !== undefined && this.connections.has(targetId)
-            if (targetId && !wasConnected) {
+            const connectedBefore = targetId !== undefined && this.isLive(targetId)
+            if (targetId && !connectedBefore) {
                 lookup = await this.tryReconnectForTool(toolName, targetId)
             }
             if (lookup.status !== "found") {
-                throw new Error(wasConnected ?
+                /* Asked again: the on-demand reconnect may have brought the server back */
+                throw new Error(targetId !== undefined && this.isLive(targetId) ?
                     `Tool "${bareName}" not found on server "${serverName}"` :
                     `Server "${serverName}" is not connected, cannot call "${bareName}"`)
             }
@@ -1387,46 +1630,74 @@ class McpProxyService {
             }
         }
 
-        const { conn, serverId, tool } = lookup
+        const { serverId } = lookup
+        let { conn, tool } = lookup
         const target = `${toolName} on ${conn.serverName}`
+
+        if (conn.stale) {
+            const live = await this.reconnectForCall(serverId, conn, tool, target)
+            conn = live.conn
+            tool = live.tool
+        }
 
         try {
             return await this.invokeTool(serverId, conn, tool, args, toolName, taskMeta)
         }
         catch (error) {
             const msg = getErrorMessage(error)
-            if (!retryOnSessionError || !(error instanceof Error) || !this.isSessionError(error)) {
+            const failure = classifyFailure(error)
+            if (failure === "other") {
+                logger.error(`[${this.userId}] Tool call failed (${target}): ${msg}`)
+                throw error
+            }
+
+            this.markStale(serverId, conn, msg)
+            if (failure === "maybe-executed" && !isRepeatable(tool)) {
+                const lostMsg = `Connection to server "${conn.serverName}" was lost during "${toolName}". Not repeated because the tool is not marked read-only or idempotent, so it may or may not have taken effect: ${msg}`
+                logger.error(`[${this.userId}] ${lostMsg}`)
+                throw new Error(lostMsg)
+            }
+            if (!retryOnSessionError) {
                 logger.error(`[${this.userId}] Tool call failed (${target}): ${msg}`)
                 throw error
             }
 
             /* Retry on the same backend. Resolving the name again could land on another
              * server: an ambiguous name may now match a different backend first. */
-            logger.warn(`[${this.userId}] Tool call failed (${target}): ${msg} - session error, reconnecting and retrying`)
-            try {
-                await this.reconnectServer(serverId)
-            }
-            catch (reconnectError) {
-                logger.error(`[${this.userId}] Reconnection failed (${target}): ${getErrorMessage(reconnectError)}`)
-                throw error
-            }
-
-            const retryConn = this.connections.get(serverId)
-            const retryTool = retryConn?.tools.find((t) => t.name === tool.name)
-            if (!retryConn || !retryTool) {
-                const goneMsg = `Tool "${tool.name}" is no longer offered by server "${conn.serverName}" after reconnecting`
-                logger.error(`[${this.userId}] Tool call failed after reconnect (${target}): ${goneMsg}`)
-                throw new Error(goneMsg)
-            }
+            logger.warn(`[${this.userId}] Tool call failed (${target}): ${msg} - connection lost, reconnecting and retrying`)
+            const live = await this.reconnectForCall(serverId, conn, tool, target, error)
 
             try {
-                return await this.invokeTool(serverId, retryConn, retryTool, args, toolName, taskMeta)
+                return await this.invokeTool(serverId, live.conn, live.tool, args, toolName, taskMeta)
             }
             catch (retryError) {
                 logger.error(`[${this.userId}] Tool call failed after reconnect (${target}): ${getErrorMessage(retryError)}`)
                 throw retryError
             }
         }
+    }
+
+    /* Reconnects a lost connection for a pending call and looks the tool up again on the same
+     * server. Throws originalError, if given, when the server cannot be reached. */
+    private async reconnectForCall (serverId: string, conn: ServerConnection, tool: ToolWithServer, target: string, originalError?: unknown): Promise<{ conn: ServerConnection, tool: ToolWithServer }> {
+        let live: ServerConnection
+        try {
+            live = await this.ensureConnected(serverId, target)
+        }
+        catch (reconnectError) {
+            const rmsg = getErrorMessage(reconnectError)
+            logger.error(`[${this.userId}] Reconnection failed (${target}): ${rmsg}`)
+            if (originalError) throw originalError
+            throw new Error(`Server "${conn.serverName}" lost its connection and could not be reached again: ${rmsg}`)
+        }
+
+        const liveTool = live.tools.find((t) => t.name === tool.name)
+        if (!liveTool) {
+            const goneMsg = `Tool "${tool.name}" is no longer offered by server "${conn.serverName}" after reconnecting`
+            logger.error(`[${this.userId}] Tool call failed after reconnect (${target}): ${goneMsg}`)
+            throw new Error(goneMsg)
+        }
+        return { conn: live, tool: liveTool }
     }
 
     /* Sends one tool call to one specific backend. The backend only knows the unqualified
@@ -1439,8 +1710,16 @@ class McpProxyService {
         if (taskMeta) {
             callParams.task = taskMeta
         }
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const result = await conn.client.callTool(callParams as any)
+        const controller = new AbortController()
+        conn.inFlight.add(controller)
+        let result
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            result = await conn.client.callTool(callParams as any, undefined, { signal: controller.signal })
+        }
+        finally {
+            conn.inFlight.delete(controller)
+        }
 
         /* If backend returned a CreateTaskResult, map the task ID */
         if (result && typeof result === "object" && "task" in result) {
@@ -1554,7 +1833,7 @@ class McpProxyService {
         const servers = this.serverManager.getServers()
         return servers.map((server) => {
             const conn = this.connections.get(server.id)
-            const isConnected = !!conn
+            const isConnected = !!conn && !conn.stale
             const state = this.reconnectState.get(server.id)
             const connectionState = this.getConnectionState(server.id, isConnected, server.enabled)
 
@@ -1576,7 +1855,7 @@ class McpProxyService {
     }
 
     isConnected (serverId: string): boolean {
-        return this.connections.has(serverId)
+        return this.isLive(serverId)
     }
 
     async testConnection (serverConfig: { type: string; config: Record<string, unknown> }): Promise<{ success: boolean; serverInfo?: { name?: string; version?: string }; toolCount?: number; error?: string }> {
@@ -1667,7 +1946,7 @@ class McpProxyService {
     }
 
     getConnectedServerCount (): number {
-        return this.connections.size
+        return [...this.connections.values()].filter((c) => !c.stale).length
     }
 
     getTotalToolCount (): number {

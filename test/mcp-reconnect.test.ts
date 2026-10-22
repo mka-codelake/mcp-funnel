@@ -220,6 +220,9 @@ describe("reconnect bookkeeping", () => {
         await assert.rejects(() => proxy.callTool("spec_whoami", {}), /Tool not found/)
         assert.equal(back.initCount(), 0, "an unqualified name must not wake a resting server")
 
+        /* The reconnect succeeds, only the tool is missing: say so, not "not connected" */
+        await assert.rejects(() => proxy.callTool("down:no_such_tool", {}), /Tool "no_such_tool" not found on server "down"/)
+
         const result = await proxy.callTool("down:spec_whoami", {}) as { content: Array<{ text: string }> }
         assert.equal(result.content[0].text, "back")
         assert.equal(statusOf(proxy).connectionState, "connected")
